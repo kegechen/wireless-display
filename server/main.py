@@ -22,9 +22,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.protocol import (
     MSG_VIDEO_FRAME, MSG_CONTROL, MSG_INPUT, MSG_CURSOR_POS,
+    MSG_H264_CHUNK, MSG_STREAM_INFO,
     send_message, recv_message,
     make_control_msg, parse_control_msg, parse_input_event,
-    pack_cursor_pos,
+    pack_cursor_pos, make_stream_info,
 )
 import ctypes
 from server.capture import ScreenCapture
@@ -32,7 +33,8 @@ from server.input_inject import InputInjector
 
 
 class WirelessDisplayServer:
-    def __init__(self, host='0.0.0.0', port=9876, monitor=1, fps=30, quality=70, force_cpu=False):
+    def __init__(self, host='0.0.0.0', port=9876, monitor=1, fps=30, quality=70,
+                 force_cpu=False, h264=False, bitrate='4M', encoder='auto'):
         self.host = host
         self.port = port
         self.target_fps = fps
@@ -40,6 +42,9 @@ class WirelessDisplayServer:
         self.client_conn = None
         self.lock = threading.Lock()
         self.vdisplay = None  # 虚拟显示器实例
+        self.h264_mode = h264
+        self.bitrate = bitrate
+        self.encoder_name = encoder
 
         self.capture = ScreenCapture(monitor_index=monitor, quality=quality, force_cpu=force_cpu)
         self.injector = InputInjector(self.capture.get_monitor_info())
@@ -56,7 +61,10 @@ class WirelessDisplayServer:
         print(f"=== Wireless Display Server ===")
         print(f"  显示器: #{self.capture.monitor_index}  {info['width']}x{info['height']} @ ({info['left']},{info['top']})")
         print(f"  监听:   {self.host}:{self.port}")
-        print(f"  帧率:   {self.target_fps} FPS,  JPEG quality={self.capture.quality}")
+        if self.h264_mode:
+            print(f"  帧率:   {self.target_fps} FPS,  H.264 bitrate={self.bitrate}")
+        else:
+            print(f"  帧率:   {self.target_fps} FPS,  JPEG quality={self.capture.quality}")
         print(f"  等待客户端连接 ...\n")
 
         try:
@@ -77,12 +85,31 @@ class WirelessDisplayServer:
                 # 发送显示器信息
                 send_message(conn, MSG_CONTROL, make_control_msg('monitor_info', **info))
 
+                # H.264 模式：发送流信息并初始化编码器
+                h264_enc = None
+                if self.h264_mode:
+                    from server.h264_encoder import H264Encoder
+                    h264_enc = H264Encoder(
+                        info['width'], info['height'],
+                        fps=self.target_fps, bitrate=self.bitrate,
+                        encoder=self.encoder_name,
+                    )
+                    send_message(conn, MSG_STREAM_INFO, make_stream_info(
+                        info['width'], info['height'], self.target_fps, h264_enc.codec_name))
+
                 # 启动接收输入线程
                 recv_t = threading.Thread(target=self._recv_loop, args=(conn,), daemon=True)
                 recv_t.start()
 
                 # 主线程发送帧
-                self._stream_loop(conn)
+                if self.h264_mode:
+                    self._stream_loop_h264(conn, h264_enc)
+                else:
+                    self._stream_loop(conn)
+
+                # 清理编码器
+                if h264_enc:
+                    h264_enc.close()
 
                 with self.lock:
                     self.client_conn = None
@@ -151,6 +178,57 @@ class WirelessDisplayServer:
             if sleep > 0:
                 time.sleep(sleep)
 
+    def _stream_loop_h264(self, conn, encoder):
+        """捕获屏幕并通过 H.264 编码发送"""
+        interval = 1.0 / self.target_fps
+        stats_time = time.time()
+        frame_count = 0
+        byte_count = 0
+
+        while self.running:
+            t0 = time.time()
+            try:
+                # 截屏 → RGB → 编码
+                rgb = self.capture.capture_rgb()
+                encoder.encode(rgb)
+                frame_count += 1
+
+                # drain 所有可用编码数据并发送
+                while True:
+                    chunk = encoder.read_chunk(timeout=0.001)
+                    if not chunk:
+                        break
+                    send_message(conn, MSG_H264_CHUNK, chunk)
+                    byte_count += len(chunk)
+
+                # 发送光标位置
+                cursor = self._get_cursor_rel_pos()
+                if cursor:
+                    send_message(conn, MSG_CURSOR_POS, pack_cursor_pos(*cursor))
+                else:
+                    send_message(conn, MSG_CURSOR_POS, pack_cursor_pos(-1.0, -1.0))
+
+                now = time.time()
+                if now - stats_time >= 5.0:
+                    fps = frame_count / (now - stats_time)
+                    mbps = byte_count * 8 / (now - stats_time) / 1_000_000
+                    avg_kb = byte_count / max(frame_count, 1) / 1024
+                    print(f"  [STAT] {fps:.1f} FPS | {mbps:.1f} Mbps | {avg_kb:.0f} KB/帧 (H.264)")
+                    stats_time = now
+                    frame_count = 0
+                    byte_count = 0
+
+            except (ConnectionError, BrokenPipeError, OSError):
+                break
+            except RuntimeError as e:
+                print(f"  [ERR] H.264 编码: {e}")
+                break
+
+            elapsed = time.time() - t0
+            sleep = interval - elapsed
+            if sleep > 0:
+                time.sleep(sleep)
+
     def _recv_loop(self, conn):
         """接收客户端输入事件"""
         while self.running:
@@ -181,6 +259,13 @@ def main():
                         help='自动创建 parsec-vdd 虚拟显示器作为副屏')
     parser.add_argument('--cpu', action='store_true',
                         help='强制 CPU 捕获模式 (禁用 dxcam/DXGI)')
+    parser.add_argument('--h264', action='store_true',
+                        help='启用 H.264 编码模式 (替代 JPEG)')
+    parser.add_argument('--bitrate', default='4M',
+                        help='H.264 码率 (默认 4M)')
+    parser.add_argument('--encoder', default='auto',
+                        choices=['auto', 'nvenc', 'qsv', 'amf', 'mf', 'cpu'],
+                        help='H.264 编码器 (默认 auto 自动检测)')
     args = parser.parse_args()
 
     if args.list_monitors:
@@ -209,6 +294,7 @@ def main():
         host=args.host, port=args.port,
         monitor=monitor, fps=args.fps, quality=args.quality,
         force_cpu=args.cpu,
+        h264=args.h264, bitrate=args.bitrate, encoder=args.encoder,
     )
     server.vdisplay = vdisplay
     server.start()

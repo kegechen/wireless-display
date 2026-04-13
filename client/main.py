@@ -24,14 +24,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.protocol import (
     MSG_VIDEO_FRAME, MSG_CONTROL, MSG_INPUT, MSG_CURSOR_POS,
+    MSG_H264_CHUNK, MSG_STREAM_INFO,
     send_message, recv_message,
     make_input_event, make_control_msg, parse_control_msg,
-    unpack_cursor_pos,
+    unpack_cursor_pos, parse_stream_info,
 )
 
 from PyQt5.QtWidgets import QApplication, QWidget
 from PyQt5.QtCore import Qt, pyqtSignal, QRect, QPoint
-from PyQt5.QtGui import QPixmap, QPainter, QCursor, QFont, QPolygon, QColor, QPen, QBrush
+from PyQt5.QtGui import QPixmap, QPainter, QCursor, QFont, QPolygon, QColor, QPen, QBrush, QImage
 
 
 # Qt Key -> Windows VK Code 映射表
@@ -69,7 +70,8 @@ QT_KEY_TO_VK = {
 class DisplayWindow(QWidget):
     """全屏显示窗口 + 输入捕获"""
 
-    frame_signal = pyqtSignal(bytes)
+    frame_signal = pyqtSignal(bytes)       # JPEG 帧
+    rgb_frame_signal = pyqtSignal(bytes)   # H.264 解码后的 RGB 帧
     status_signal = pyqtSignal(str)
     cursor_signal = pyqtSignal(float, float)
 
@@ -101,11 +103,16 @@ class DisplayWindow(QWidget):
         # 远程光标位置（窗口像素坐标），None 表示不显示
         self.remote_cursor_pos = None
 
+        # H.264 解码器
+        self.h264_decoder = None
+        self.stream_info = None
+
         # 状态文字
         self.status_text = "正在连接 ..."
 
         # 信号槽
         self.frame_signal.connect(self._on_frame)
+        self.rgb_frame_signal.connect(self._on_rgb_frame)
         self.status_signal.connect(self._on_status)
         self.cursor_signal.connect(self._on_cursor_pos)
 
@@ -197,6 +204,29 @@ class DisplayWindow(QWidget):
 
             self.update()
 
+    def _on_rgb_frame(self, rgb_data):
+        """处理 H.264 解码后的 RGB 帧。"""
+        if not self.stream_info:
+            return
+        w = self.stream_info['width']
+        h = self.stream_info['height']
+        img = QImage(rgb_data, w, h, w * 3, QImage.Format_RGB888).copy()
+        pixmap = QPixmap.fromImage(img)
+        if not pixmap.isNull():
+            self.current_pixmap = pixmap
+            self._update_image_rect()
+
+            # FPS 统计
+            self.frame_count += 1
+            now = time.time()
+            dt = now - self.fps_time
+            if dt >= 1.0:
+                self.current_fps = self.frame_count / dt
+                self.frame_count = 0
+                self.fps_time = now
+
+            self.update()
+
     def _on_status(self, text):
         self.status_text = text
         self.current_pixmap = None
@@ -241,6 +271,22 @@ class DisplayWindow(QWidget):
                     elif msg_type == MSG_CURSOR_POS:
                         rx, ry = unpack_cursor_pos(payload)
                         self.cursor_signal.emit(rx, ry)
+                    elif msg_type == MSG_STREAM_INFO:
+                        self.stream_info = parse_stream_info(payload)
+                        w = self.stream_info['width']
+                        h = self.stream_info['height']
+                        print(f"  [H264] 流信息: {w}x{h} @ {self.stream_info['fps']}fps, 解码器初始化中...")
+                        from client.h264_decoder import H264Decoder
+                        if self.h264_decoder:
+                            self.h264_decoder.close()
+                        self.h264_decoder = H264Decoder(w, h)
+                        # 启动解码帧读取线程
+                        dec_thread = threading.Thread(
+                            target=self._decode_read_loop, daemon=True)
+                        dec_thread.start()
+                    elif msg_type == MSG_H264_CHUNK:
+                        if self.h264_decoder:
+                            self.h264_decoder.feed(payload)
                     elif msg_type == MSG_CONTROL:
                         ctrl = parse_control_msg(payload)
                         if ctrl.get('cmd') == 'monitor_info':
@@ -257,9 +303,21 @@ class DisplayWindow(QWidget):
                         except OSError:
                             pass
                         self.sock = None
+                # 清理 H.264 解码器
+                if self.h264_decoder:
+                    self.h264_decoder.close()
+                    self.h264_decoder = None
+                    self.stream_info = None
 
             if self.running:
                 time.sleep(2)
+
+    def _decode_read_loop(self):
+        """持续从 H.264 解码器读取 RGB 帧并发送到 UI。"""
+        while self.running and self.connected and self.h264_decoder:
+            frame = self.h264_decoder.read_frame(timeout=0.05)
+            if frame:
+                self.rgb_frame_signal.emit(frame)
 
     def _send_input(self, event_type, **kwargs):
         with self.sock_lock:
@@ -339,6 +397,9 @@ class DisplayWindow(QWidget):
 
     def closeEvent(self, event):
         self.running = False
+        if self.h264_decoder:
+            self.h264_decoder.close()
+            self.h264_decoder = None
         with self.sock_lock:
             self.connected = False
             if self.sock:

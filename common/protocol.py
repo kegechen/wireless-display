@@ -8,6 +8,8 @@ Message types:
   0x02 = CONTROL      (JSON, bidirectional)
   0x03 = INPUT_EVENT  (JSON, client -> server)
   0x04 = CURSOR_POS   (8 bytes: 2x float32 rel_x, rel_y, server -> client)
+  0x05 = H264_CHUNK   (H.264 encoded data, server -> client)
+  0x06 = STREAM_INFO  (JSON: width/height/fps/codec, server -> client)
 """
 
 import struct
@@ -18,6 +20,8 @@ MSG_VIDEO_FRAME = 0x01
 MSG_CONTROL = 0x02
 MSG_INPUT = 0x03
 MSG_CURSOR_POS = 0x04
+MSG_H264_CHUNK = 0x05
+MSG_STREAM_INFO = 0x06
 
 
 def pack_cursor_pos(rel_x, rel_y):
@@ -83,4 +87,20 @@ def make_control_msg(cmd, **kwargs):
 
 def parse_control_msg(data):
     """Parse a control message from bytes."""
+    return json.loads(data.decode('utf-8'))
+
+
+def make_stream_info(width, height, fps, codec):
+    """Create a stream info payload for H.264 mode."""
+    info = {
+        'width': width,
+        'height': height,
+        'fps': fps,
+        'codec': codec,
+    }
+    return json.dumps(info, separators=(',', ':')).encode('utf-8')
+
+
+def parse_stream_info(data):
+    """Parse stream info from bytes."""
     return json.loads(data.decode('utf-8'))

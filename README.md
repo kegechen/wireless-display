@@ -1,16 +1,16 @@
 # Wireless Display - Windows 11 无线副屏
 
-将 UOS (ARM) 设备作为 Windows 11 的无线扩展副屏，支持画面实时传输和鼠标键盘回传。
+将其他设备作为 Windows 11 的无线扩展副屏，支持画面实时传输和鼠标键盘回传。
 
 ## 架构
 
 ```
-Windows 11 (服务端)                    UOS ARM (客户端)
+Windows 11 (服务端)                    Linux (客户端)
 ┌─────────────────────┐   TCP 9876   ┌─────────────────────┐
 │  ParsecVDD 虚拟显示器│              │                     │
 │  ↓                   │              │                     │
 │  mss/dxcam 屏幕捕获 │ ──────────→  │  PyQt5 全屏显示     │
-│  JPEG 编码           │   视频帧     │  JPEG 解码          │
+│  JPEG/H.264 编码     │   视频帧     │  JPEG/H.264 解码    │
 │  光标位置采集        │ ──────────→  │  光标绘制           │
 │                      │   光标坐标   │                     │
 │  SendInput 输入注入  │ ←──────────  │  鼠标/键盘事件捕获  │
@@ -21,7 +21,7 @@ Windows 11 (服务端)                    UOS ARM (客户端)
 
 | 项目 | Windows 服务端 | UOS 客户端 |
 |------|---------------|-----------|
-| 系统 | Windows 10/11 | UOS (ARM/x86) |
+| 系统 | Windows 10/11 | Linux (ARM/x86) |
 | Python | 3.8+ | 3.6+ |
 | 网络 | 两台设备在同一局域网内，防火墙放行 TCP 9876 端口 |
 
@@ -104,10 +104,16 @@ bash ~/wireless-display/setup_client.sh
 ```bash
 cd wireless-display
 
-# 捕获虚拟副屏（编号替换为第一步确认的编号）
+# JPEG 模式（默认）
 python -m server.main --monitor 3 --fps 30 --quality 70
 
-# 如果 dxcam 崩溃，使用 CPU 模式
+# H.264 模式（推荐，带宽约 4Mbps，需系统安装 ffmpeg）
+python -m server.main --monitor 3 --fps 30 --h264 --bitrate 4M
+
+# H.264 + 指定编码器
+python -m server.main --monitor 3 --h264 --encoder nvenc
+
+# 如果 dxcam 崩溃，使用 CPU 捕获模式
 python -m server.main --monitor 3 --fps 30 --quality 70 --cpu
 ```
 
@@ -116,7 +122,7 @@ python -m server.main --monitor 3 --fps 30 --quality 70 --cpu
 === Wireless Display Server ===
   显示器: #3  2160x1440 @ (-2160,0)
   监听:   0.0.0.0:9876
-  帧率:   30 FPS,  JPEG quality=70
+  帧率:   30 FPS,  H.264 bitrate=4M
   等待客户端连接 ...
 ```
 
@@ -158,6 +164,9 @@ python3 -m client.main --host 192.168.137.1
 | `--monitor` | 1 | 显示器编号（用 `--list-monitors` 查看） |
 | `--fps` | 30 | 目标帧率 |
 | `--quality` | 70 | JPEG 质量 1-100（越高画质越好，带宽越大） |
+| `--h264` | - | 启用 H.264 编码模式（替代 JPEG，需 ffmpeg） |
+| `--bitrate` | 4M | H.264 码率（如 2M、4M、8M） |
+| `--encoder` | auto | H.264 编码器：auto/nvenc/qsv/amf/mf/cpu |
 | `--cpu` | - | 强制 CPU 捕获模式（禁用 dxcam） |
 | `--list-monitors` | - | 列出所有显示器并退出 |
 
@@ -180,10 +189,17 @@ python3 -m client.main --host 192.168.137.1
 - 添加 `--cpu` 参数使用 CPU 捕获模式
 
 ### Q: 画面卡顿/延迟高
+- **推荐使用 H.264 模式**：`--h264` 可将带宽从 ~17Mbps 降至 ~4Mbps
 - 降低分辨率：在 Windows 显示设置中调低虚拟显示器分辨率
-- 降低质量：`--quality 50`
+- JPEG 模式降低质量：`--quality 50`
+- H.264 模式降低码率：`--bitrate 2M`
 - 降低帧率：`--fps 20`
 - 确保使用 5GHz WiFi 或有线网络
+
+### Q: H.264 模式启动失败
+- 确认系统已安装 ffmpeg 并在 PATH 中（`ffmpeg -version` 检查）
+- 如果硬件编码器不可用，会自动降级到 libx264 软编码
+- 可用 `--encoder cpu` 强制使用软编码
 
 ### Q: ParsecVDisplay 托盘没有出现
 - 确认 `parsec-vdd-0.45.0.0.exe` 驱动已安装成功
@@ -196,15 +212,19 @@ python3 -m client.main --host 192.168.137.1
 wireless-display/
 ├── common/
 │   ├── __init__.py          # 包初始化
-│   └── protocol.py          # TCP 帧协议（视频帧、光标位置、输入事件）
+│   └── protocol.py          # TCP 帧协议（视频帧、光标位置、输入事件、H.264）
 ├── server/
 │   ├── main.py              # 服务端入口
 │   ├── capture.py           # 屏幕捕获（GPU/CPU 双模式）
+│   ├── h264_encoder.py      # H.264 编码器（ffmpeg 管道，自动检测硬件编码器）
 │   ├── input_inject.py      # Windows 输入注入（SendInput API）
 │   └── virtual_display.py   # 虚拟显示器管理
 ├── client/
 │   ├── __init__.py          # 包初始化
-│   └── main.py              # 客户端入口（PyQt5 全屏显示 + 输入捕获）
+│   ├── main.py              # 客户端入口（PyQt5 全屏显示 + 输入捕获）
+│   └── h264_decoder.py      # H.264 解码器（ffmpeg 管道，自动检测硬件解码器）
+├── docs/
+│   └── h264-plan.md         # H.264 实现方案文档
 ├── tools/
 │   └── parsec-vdd/          # ParsecVDD 虚拟显示器驱动
 │       ├── parsec-vdd-0.45.0.0.exe   # 驱动安装包
@@ -228,3 +248,5 @@ wireless-display/
 | CONTROL | 0x02 | 双向 | JSON 控制消息 |
 | INPUT | 0x03 | Client → Server | JSON 输入事件 |
 | CURSOR_POS | 0x04 | Server → Client | 光标坐标 (2x float32) |
+| H264_CHUNK | 0x05 | Server → Client | H.264 编码数据块 |
+| STREAM_INFO | 0x06 | Server → Client | 流信息 JSON（宽高、fps、编码器） |
